@@ -67,6 +67,7 @@ runs:
       shell: bash
       env:
         GH_TOKEN: ${{ github.token }}
+        COMMENT_BODY: ${{ steps.audit.outputs.body }}
       run: |
         # Check for existing audit comment and update it, or create new
         existing=$(gh pr view ${{ github.event.number }} --json comments --jq '.comments[] | select(.body | startswith("## Supply Chain Audit")) | .url' 2>/dev/null | head -1)
@@ -79,5 +80,3 @@ runs:
         else
           gh pr comment ${{ github.event.number }} --body "$COMMENT_BODY"
         fi
-      env:
-        COMMENT_BODY: ${{ steps.audit.outputs.body }}
