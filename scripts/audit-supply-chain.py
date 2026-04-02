@@ -22,6 +22,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import tomllib
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -95,22 +96,29 @@ Respond ONLY with the JSON object. No markdown fences, no commentary.\
 
 
 def parse_lockfile(text: str) -> dict[str, dict[str, str | None]]:
-    """Parse a Cargo.lock into {name: {version: checksum}} for registry packages."""
+    """Parse a Cargo.lock into {name: {version: checksum}} for registry packages.
+
+    Uses tomllib for correct TOML parsing. Only includes packages sourced from
+    a registry (path and git dependencies are excluded).
+    """
+    if not text.strip():
+        return {}
+
+    data = tomllib.loads(text)
     packages: dict[str, dict[str, str | None]] = {}
-    for block in re.split(r"\n\[", text):
-        name_m = re.search(r'^name = "(.+)"', block, re.MULTILINE)
-        ver_m = re.search(r'^version = "(.+)"', block, re.MULTILINE)
-        source_m = re.search(r'^source = "(.+)"', block, re.MULTILINE)
-        checksum_m = re.search(r'^checksum = "(.+)"', block, re.MULTILINE)
-        if not (name_m and ver_m):
+
+    for pkg in data.get("package", []):
+        name = pkg.get("name")
+        version = pkg.get("version")
+        source = pkg.get("source", "")
+        if not name or not version:
             continue
-        # Only check registry deps
-        if not source_m or "registry" not in source_m.group(1):
+        # Only include registry deps (path deps have no source, git deps use git+)
+        if "registry" not in source:
             continue
-        name = name_m.group(1)
-        ver = ver_m.group(1)
-        checksum = checksum_m.group(1) if checksum_m else None
-        packages.setdefault(name, {})[ver] = checksum
+        checksum = pkg.get("checksum")
+        packages.setdefault(name, {})[version] = checksum
+
     return packages
 
 
