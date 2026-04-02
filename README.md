@@ -100,4 +100,4 @@ The diff is then sent to Claude with a system prompt tuned for supply chain atta
 
 ## License
 
-MIT
+Prelude Research License — see [LICENSE](LICENSE) for details.
