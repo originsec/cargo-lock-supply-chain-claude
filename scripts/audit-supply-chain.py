@@ -413,7 +413,10 @@ def call_claude(
                 text = re.sub(r"^```\w*\n?", "", text)
                 text = re.sub(r"\n?```$", "", text)
                 text = text.strip()
-            return json.loads(text)
+            # Use raw_decode so trailing commentary after the JSON object
+            # doesn't cause json.loads to raise "Extra data".
+            parsed, _ = json.JSONDecoder().raw_decode(text)
+            return parsed
         except json.JSONDecodeError as e:
             last_err = f"Invalid JSON from Claude: {e}\nRaw response: {text[:500]}"
         except (urllib.error.URLError, OSError) as e:
