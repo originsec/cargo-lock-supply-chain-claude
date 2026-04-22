@@ -90,7 +90,7 @@ runs:
         COMMENT_BODY: ${{ steps.audit.outputs.body }}
       run: |
         # Check for existing audit comment and update it, or create new
-        existing=$(gh pr view ${{ github.event.number }} --json comments --jq '.comments[] | select(.body | startswith("## Supply Chain Audit")) | .url' 2>/dev/null | head -1)
+        existing=$(gh pr view ${{ github.event.number }} --json comments --jq '.comments[] | select(.body | startswith("## Supply Chain Audit - Cargo")) | .url' 2>/dev/null | head -1)
         if [ -n "$existing" ]; then
           # Extract comment ID from URL
           comment_id=$(echo "$existing" | grep -oP '\d+$')
