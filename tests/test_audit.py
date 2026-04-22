@@ -28,6 +28,34 @@ collect_files = audit.collect_files
 diff_crates = audit.diff_crates
 format_comment = audit.format_comment
 extract_crate = audit.extract_crate
+LOCKFILE_RE = audit.LOCKFILE_RE
+
+
+# ---------------------------------------------------------------------------
+# LOCKFILE_RE (nested Cargo.lock discovery)
+# ---------------------------------------------------------------------------
+
+
+class TestLockfileRegex:
+    def test_matches_root(self):
+        assert LOCKFILE_RE.search("Cargo.lock")
+
+    def test_matches_nested(self):
+        assert LOCKFILE_RE.search("backend/Cargo.lock")
+
+    def test_matches_deeply_nested(self):
+        assert LOCKFILE_RE.search("crates/core/subproject/Cargo.lock")
+
+    def test_rejects_cargo_toml(self):
+        assert not LOCKFILE_RE.search("Cargo.toml")
+        assert not LOCKFILE_RE.search("backend/Cargo.toml")
+
+    def test_rejects_similar_suffix(self):
+        assert not LOCKFILE_RE.search("MyCargo.lock")
+        assert not LOCKFILE_RE.search("Cargo.lock.bak")
+
+    def test_rejects_directory_name(self):
+        assert not LOCKFILE_RE.search("Cargo.lock/readme.md")
 
 
 # ---------------------------------------------------------------------------

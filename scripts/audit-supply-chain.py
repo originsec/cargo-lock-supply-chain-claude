@@ -134,6 +134,25 @@ def parse_semver(v: str) -> tuple[int, int, int]:
 # Change detection
 # ---------------------------------------------------------------------------
 
+LOCKFILE_RE = re.compile(r"(?:^|/)Cargo\.lock$")
+
+
+def discover_changed_lockfiles(base_ref: str) -> list[str]:
+    """Return every Cargo.lock path (root or nested) changed since base_ref."""
+    try:
+        output = subprocess.check_output(
+            ["git", "diff", "--name-only", f"{base_ref}...HEAD"],
+            text=True,
+            stderr=subprocess.PIPE,
+        )
+    except subprocess.CalledProcessError as e:
+        print(
+            f"::warning::git diff against {base_ref} failed: {e.stderr.strip()}",
+            file=sys.stderr,
+        )
+        return []
+    return [line for line in output.splitlines() if LOCKFILE_RE.search(line)]
+
 
 @dataclass
 class Change:
@@ -560,35 +579,57 @@ def main() -> int:
         except (OSError, json.JSONDecodeError):
             pass
 
-    # Read base and head Cargo.lock
-    try:
-        base_text = subprocess.check_output(
-            ["git", "show", f"{base_ref}:Cargo.lock"],
-            text=True,
-            stderr=subprocess.PIPE,
-        )
-    except subprocess.CalledProcessError:
-        print(f"::warning::Could not read Cargo.lock from {base_ref}, treating all deps as new.",
-              file=sys.stderr)
-        base_text = ""
+    lockfiles = discover_changed_lockfiles(base_ref)
+    if not lockfiles:
+        print("No Cargo.lock changes detected.", file=sys.stderr)
+        return 0
 
-    try:
-        with open("Cargo.lock") as f:
-            head_text = f.read()
-    except OSError as e:
-        print(f"::error::Could not read Cargo.lock: {e}", file=sys.stderr)
-        return 1
+    print(
+        f"Auditing {len(lockfiles)} changed Cargo.lock file(s): {', '.join(lockfiles)}",
+        file=sys.stderr,
+    )
 
-    base_pkgs = parse_lockfile(base_text)
-    head_pkgs = parse_lockfile(head_text)
-    changes = compute_changes(base_pkgs, head_pkgs)
+    # Merge changes across all lockfiles, deduping by (name, old_version, new_version).
+    # A monorepo may have the same crate upgrade in multiple lockfiles — the source
+    # diff is identical, so auditing once is sufficient.
+    merged: dict[tuple[str, str | None, str | None], Change] = {}
+    for lockfile in lockfiles:
+        try:
+            base_text = subprocess.check_output(
+                ["git", "show", f"{base_ref}:{lockfile}"],
+                text=True,
+                stderr=subprocess.PIPE,
+            )
+        except subprocess.CalledProcessError:
+            print(
+                f"::warning::Could not read {lockfile} from {base_ref}, "
+                f"treating all deps as new.",
+                file=sys.stderr,
+            )
+            base_text = ""
+
+        try:
+            with open(lockfile) as f:
+                head_text = f.read()
+        except OSError as e:
+            print(f"::warning::Could not read {lockfile}: {e}", file=sys.stderr)
+            continue
+
+        base_pkgs = parse_lockfile(base_text)
+        head_pkgs = parse_lockfile(head_text)
+        for change in compute_changes(base_pkgs, head_pkgs):
+            merged.setdefault(
+                (change.name, change.old_version, change.new_version), change
+            )
+
+    changes = sorted(merged.values(), key=lambda c: c.name)
 
     if not changes:
         print("No registry dependency changes detected.", file=sys.stderr)
         return 0
 
     print(
-        f"Found {len(changes)} dependency change(s) to audit.",
+        f"Found {len(changes)} unique dependency change(s) to audit.",
         file=sys.stderr,
     )
 

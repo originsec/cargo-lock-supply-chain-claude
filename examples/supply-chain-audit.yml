@@ -5,7 +5,7 @@ name: Supply Chain Audit
 on:
   pull_request:
     paths:
-      - "Cargo.lock"
+      - "**/Cargo.lock"
 
 permissions:
   contents: read
