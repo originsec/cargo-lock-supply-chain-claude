@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import re
 import sys
 import textwrap
 from pathlib import Path
@@ -33,6 +32,7 @@ cache_key = audit.cache_key
 load_verdict_cache = audit.load_verdict_cache
 save_verdict_cache = audit.save_verdict_cache
 CACHE_VERSION = audit.CACHE_VERSION
+parse_verdict_text = audit.parse_verdict_text
 
 
 # ---------------------------------------------------------------------------
@@ -653,37 +653,26 @@ class TestFormatComment:
 
 
 class TestCallClaudeResponseParsing:
-    """Test the response parsing logic without making real API calls."""
-
-    def _parse(self, raw: str) -> dict:
-        text = raw.strip()
-        if text.startswith("```"):
-            text = re.sub(r"^```\w*\n?", "", text)
-            text = re.sub(r"\n?```$", "", text)
-            text = text.strip()
-        parsed, _ = json.JSONDecoder().raw_decode(text)
-        return parsed
+    """Exercises parse_verdict_text, the verdict extractor call_claude uses."""
 
     def test_strips_markdown_fences(self):
         raw = '```json\n{"risk": "none", "summary": "OK", "findings": []}\n```'
-        assert self._parse(raw)["risk"] == "none"
+        assert parse_verdict_text(raw)["risk"] == "none"
 
     def test_plain_json(self):
         raw = '{"risk": "low", "summary": "Minor.", "findings": []}'
-        assert self._parse(raw)["risk"] == "low"
+        assert parse_verdict_text(raw)["risk"] == "low"
 
     def test_fences_without_language(self):
         raw = '```\n{"risk": "medium", "summary": "Check.", "findings": []}\n```'
-        assert self._parse(raw)["risk"] == "medium"
+        assert parse_verdict_text(raw)["risk"] == "medium"
 
     def test_json_with_trailing_commentary(self):
-        # Claude sometimes appends explanatory prose after the JSON object;
-        # raw_decode tolerates it where json.loads would raise "Extra data".
         raw = (
             '{"risk": "none", "summary": "Routine.", "findings": []}\n\n'
             "The diff shows a standard version increment with no concerns."
         )
-        result = self._parse(raw)
+        result = parse_verdict_text(raw)
         assert result["risk"] == "none"
         assert result["summary"] == "Routine."
 
@@ -692,4 +681,38 @@ class TestCallClaudeResponseParsing:
             '```json\n{"risk": "low", "summary": "Minor.", "findings": []}\n```\n'
             "Additional notes from the model."
         )
-        assert self._parse(raw)["risk"] == "low"
+        assert parse_verdict_text(raw)["risk"] == "low"
+
+    def test_json_with_leading_commentary(self):
+        # Observed in production: Claude prefixes the JSON with a sentence
+        # describing what it's about to do, then emits the object.
+        raw = (
+            "Looking at the diff for the newly added \"portable-atomic\" "
+            "dependency version 1.13.1, I'll analyze the key components:\n\n"
+            '{"risk": "low", "summary": "Routine atomics crate.", "findings": []}'
+        )
+        result = parse_verdict_text(raw)
+        assert result["risk"] == "low"
+        assert result["summary"] == "Routine atomics crate."
+
+    def test_json_with_leading_and_trailing_commentary(self):
+        raw = (
+            "Here is the verdict:\n\n"
+            '{"risk": "medium", "summary": "Unusual.", "findings": []}\n\n'
+            "Let me know if you want me to dig deeper."
+        )
+        assert parse_verdict_text(raw)["risk"] == "medium"
+
+    def test_leading_prose_contains_stray_brace(self):
+        # A `{` inside the leading prose must not derail extraction — the
+        # extractor has to walk past non-parseable starts.
+        raw = (
+            "I noticed a pattern like `fn foo() { ... }` in build.rs, "
+            "but the overall verdict is:\n\n"
+            '{"risk": "low", "summary": "Benign.", "findings": []}'
+        )
+        assert parse_verdict_text(raw)["risk"] == "low"
+
+    def test_no_json_raises(self):
+        with pytest.raises(json.JSONDecodeError):
+            parse_verdict_text("no json here, just prose")
