@@ -162,6 +162,8 @@ class Change:
     old_version: str | None
     new_version: str | None
     change_type: str  # "added", "upgraded", "downgraded"
+    old_checksum: str | None = None
+    new_checksum: str | None = None
 
 
 def compute_changes(
@@ -189,7 +191,15 @@ def compute_changes(
         if name not in base_pkgs:
             # Entirely new dependency
             for ver in sorted(added, key=parse_semver):
-                changes.append(Change(name, None, ver, "added"))
+                changes.append(
+                    Change(
+                        name=name,
+                        old_version=None,
+                        new_version=ver,
+                        change_type="added",
+                        new_checksum=head_pkgs[name].get(ver),
+                    )
+                )
         else:
             # Version changed — pair up removed/added versions
             removed_sorted = sorted(removed, key=parse_semver)
@@ -203,7 +213,16 @@ def compute_changes(
                     if parse_semver(new_v) < parse_semver(old_v)
                     else "upgraded"
                 )
-                changes.append(Change(name, old_v, new_v, change_type))
+                changes.append(
+                    Change(
+                        name=name,
+                        old_version=old_v,
+                        new_version=new_v,
+                        change_type=change_type,
+                        old_checksum=base_pkgs[name].get(old_v),
+                        new_checksum=head_pkgs[name].get(new_v),
+                    )
+                )
             else:
                 # Multiple version changes — pair by position, extras are adds
                 for old_v in removed_sorted:
@@ -214,9 +233,26 @@ def compute_changes(
                             if parse_semver(new_v) < parse_semver(old_v)
                             else "upgraded"
                         )
-                        changes.append(Change(name, old_v, new_v, change_type))
+                        changes.append(
+                            Change(
+                                name=name,
+                                old_version=old_v,
+                                new_version=new_v,
+                                change_type=change_type,
+                                old_checksum=base_pkgs[name].get(old_v),
+                                new_checksum=head_pkgs[name].get(new_v),
+                            )
+                        )
                 for new_v in added_sorted:
-                    changes.append(Change(name, None, new_v, "added"))
+                    changes.append(
+                        Change(
+                            name=name,
+                            old_version=None,
+                            new_version=new_v,
+                            change_type="added",
+                            new_checksum=head_pkgs[name].get(new_v),
+                        )
+                    )
 
     return changes
 
@@ -581,6 +617,47 @@ def format_comment(verdicts: list[Verdict]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Verdict cache
+# ---------------------------------------------------------------------------
+#
+# Cargo.lock records a content hash (checksum) for every registry dep, so
+# a (name, old_checksum, new_checksum) triple is a truly immutable identity
+# for a given audit: crates.io does not republish a version under the same
+# hash. Cache entries keyed this way can be safely shared across repos.
+
+CACHE_VERSION = 1
+
+
+def cache_key(name: str, old_id: str | None, new_id: str | None) -> str:
+    return f"{name}|{old_id or ''}|{new_id or ''}"
+
+
+def load_verdict_cache(path: str | None) -> dict[str, dict]:
+    if not path:
+        return {}
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict) or data.get("version") != CACHE_VERSION:
+        return {}
+    entries = data.get("entries", {})
+    return entries if isinstance(entries, dict) else {}
+
+
+def save_verdict_cache(path: str | None, cache: dict[str, dict]) -> None:
+    if not path:
+        return
+    try:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w") as f:
+            json.dump({"version": CACHE_VERSION, "entries": cache}, f)
+    except OSError as e:
+        print(f"::warning::Failed to save verdict cache: {e}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -665,6 +742,10 @@ def main() -> int:
         file=sys.stderr,
     )
 
+    cache_path = os.environ.get("AUDIT_CACHE_FILE")
+    cache = load_verdict_cache(cache_path)
+    cache_hits = 0
+
     verdicts: list[Verdict] = []
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -676,6 +757,22 @@ def main() -> int:
                 f"({change.old_version} -> {change.new_version})...",
                 file=sys.stderr,
             )
+
+            # Cache lookup before any network I/O or Claude call.
+            key = cache_key(change.name, change.old_checksum, change.new_checksum)
+            if key in cache:
+                entry = cache[key]
+                verdicts.append(
+                    Verdict(
+                        change=change,
+                        risk=entry.get("risk", "medium"),
+                        summary=entry.get("summary", ""),
+                        findings=entry.get("findings", []),
+                    )
+                )
+                cache_hits += 1
+                print(f"  cache hit ({key})", file=sys.stderr)
+                continue
 
             # Download and extract new version
             new_tarball = download_crate(change.name, change.new_version, tmp)
@@ -726,14 +823,13 @@ def main() -> int:
             diff_text = diff_crates(old_dir, new_dir)
             if not diff_text.strip():
                 # No actual source changes (maybe only checksum changed)
-                verdicts.append(
-                    Verdict(
-                        change=change,
-                        risk="none",
-                        summary="No source changes detected between versions.",
-                        findings=[],
-                    )
-                )
+                entry = {
+                    "risk": "none",
+                    "summary": "No source changes detected between versions.",
+                    "findings": [],
+                }
+                cache[key] = entry
+                verdicts.append(Verdict(change=change, **entry))
                 continue
 
             # Call Claude
@@ -747,14 +843,25 @@ def main() -> int:
                 model=model,
             )
 
-            verdicts.append(
-                Verdict(
-                    change=change,
-                    risk=verdict_data.get("risk", "medium"),
-                    summary=verdict_data.get("summary", "No summary provided."),
-                    findings=verdict_data.get("findings", []),
-                )
-            )
+            entry = {
+                "risk": verdict_data.get("risk", "medium"),
+                "summary": verdict_data.get("summary", "No summary provided."),
+                "findings": verdict_data.get("findings", []),
+            }
+            # Only cache successful Claude verdicts — transient errors (network
+            # failures, rate limits) should re-try on the next run rather than
+            # pinning "high — audit failed" forever.
+            if "Audit failed" not in entry["summary"]:
+                cache[key] = entry
+            verdicts.append(Verdict(change=change, **entry))
+
+    save_verdict_cache(cache_path, cache)
+    if cache_path:
+        print(
+            f"Verdict cache: {cache_hits}/{len(changes)} hits; "
+            f"{len(cache)} total entries stored.",
+            file=sys.stderr,
+        )
 
     # Format and output the comment
     comment = format_comment(verdicts)
