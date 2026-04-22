@@ -29,6 +29,67 @@ diff_crates = audit.diff_crates
 format_comment = audit.format_comment
 extract_crate = audit.extract_crate
 LOCKFILE_RE = audit.LOCKFILE_RE
+cache_key = audit.cache_key
+load_verdict_cache = audit.load_verdict_cache
+save_verdict_cache = audit.save_verdict_cache
+CACHE_VERSION = audit.CACHE_VERSION
+
+
+# ---------------------------------------------------------------------------
+# Verdict cache
+# ---------------------------------------------------------------------------
+
+
+class TestCacheKey:
+    def test_includes_all_identifiers(self):
+        assert cache_key("serde", "abc", "def") == "serde|abc|def"
+
+    def test_none_old_id_encodes_as_empty(self):
+        assert cache_key("serde", None, "def") == "serde||def"
+
+    def test_different_versions_differ(self):
+        assert cache_key("serde", "a", "b") != cache_key("serde", "a", "c")
+
+    def test_different_names_differ(self):
+        assert cache_key("a", "x", "y") != cache_key("b", "x", "y")
+
+
+class TestVerdictCache:
+    def test_returns_empty_when_path_none(self):
+        assert load_verdict_cache(None) == {}
+
+    def test_missing_file_returns_empty(self, tmp_path):
+        assert load_verdict_cache(str(tmp_path / "nope.json")) == {}
+
+    def test_malformed_json_returns_empty(self, tmp_path):
+        p = tmp_path / "cache.json"
+        p.write_text("{not json")
+        assert load_verdict_cache(str(p)) == {}
+
+    def test_wrong_version_returns_empty(self, tmp_path):
+        p = tmp_path / "cache.json"
+        p.write_text(json.dumps({"version": 999, "entries": {"k": {"risk": "none"}}}))
+        assert load_verdict_cache(str(p)) == {}
+
+    def test_roundtrip(self, tmp_path):
+        p = str(tmp_path / "cache.json")
+        entries = {
+            "serde|abc|def": {"risk": "none", "summary": "OK", "findings": []},
+            "tokio||xyz": {"risk": "low", "summary": "Minor.", "findings": []},
+        }
+        save_verdict_cache(p, entries)
+        assert load_verdict_cache(p) == entries
+
+    def test_save_no_path_is_noop(self):
+        save_verdict_cache(None, {"x": {"risk": "none"}})  # must not raise
+
+    def test_version_stored(self, tmp_path):
+        p = str(tmp_path / "cache.json")
+        save_verdict_cache(p, {"k": {"risk": "none"}})
+        with open(p) as f:
+            data = json.load(f)
+        assert data["version"] == CACHE_VERSION
+        assert data["entries"] == {"k": {"risk": "none"}}
 
 
 # ---------------------------------------------------------------------------
@@ -238,7 +299,9 @@ class TestComputeChanges:
         head = {"serde": {"1.0.200": "abc"}}
         changes = compute_changes(base, head)
         assert len(changes) == 1
-        assert changes[0] == Change("serde", None, "1.0.200", "added")
+        assert changes[0] == Change(
+            "serde", None, "1.0.200", "added", new_checksum="abc"
+        )
 
     def test_removed_dependency_skipped(self):
         base = {"serde": {"1.0.200": "abc"}}
@@ -251,14 +314,20 @@ class TestComputeChanges:
         head = {"serde": {"1.0.201": "bbb"}}
         changes = compute_changes(base, head)
         assert len(changes) == 1
-        assert changes[0] == Change("serde", "1.0.200", "1.0.201", "upgraded")
+        assert changes[0] == Change(
+            "serde", "1.0.200", "1.0.201", "upgraded",
+            old_checksum="aaa", new_checksum="bbb",
+        )
 
     def test_downgrade(self):
         base = {"serde": {"1.0.201": "bbb"}}
         head = {"serde": {"1.0.200": "aaa"}}
         changes = compute_changes(base, head)
         assert len(changes) == 1
-        assert changes[0] == Change("serde", "1.0.201", "1.0.200", "downgraded")
+        assert changes[0] == Change(
+            "serde", "1.0.201", "1.0.200", "downgraded",
+            old_checksum="bbb", new_checksum="aaa",
+        )
 
     def test_major_upgrade(self):
         base = {"tokio": {"0.2.25": "aaa"}}
@@ -295,7 +364,10 @@ class TestComputeChanges:
         head = {"ahash": {"0.7.8": "a", "0.8.12": "c"}}
         changes = compute_changes(base, head)
         assert len(changes) == 1
-        assert changes[0] == Change("ahash", "0.8.11", "0.8.12", "upgraded")
+        assert changes[0] == Change(
+            "ahash", "0.8.11", "0.8.12", "upgraded",
+            old_checksum="b", new_checksum="c",
+        )
 
     def test_sorted_output(self):
         base = {}
