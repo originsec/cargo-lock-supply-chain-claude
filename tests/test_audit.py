@@ -583,27 +583,41 @@ class TestFormatComment:
 class TestCallClaudeResponseParsing:
     """Test the response parsing logic without making real API calls."""
 
-    def test_strips_markdown_fences(self):
-        raw = '```json\n{"risk": "none", "summary": "OK", "findings": []}\n```'
+    def _parse(self, raw: str) -> dict:
         text = raw.strip()
         if text.startswith("```"):
             text = re.sub(r"^```\w*\n?", "", text)
             text = re.sub(r"\n?```$", "", text)
             text = text.strip()
-        result = json.loads(text)
-        assert result["risk"] == "none"
+        parsed, _ = json.JSONDecoder().raw_decode(text)
+        return parsed
+
+    def test_strips_markdown_fences(self):
+        raw = '```json\n{"risk": "none", "summary": "OK", "findings": []}\n```'
+        assert self._parse(raw)["risk"] == "none"
 
     def test_plain_json(self):
         raw = '{"risk": "low", "summary": "Minor.", "findings": []}'
-        result = json.loads(raw.strip())
-        assert result["risk"] == "low"
+        assert self._parse(raw)["risk"] == "low"
 
     def test_fences_without_language(self):
         raw = '```\n{"risk": "medium", "summary": "Check.", "findings": []}\n```'
-        text = raw.strip()
-        if text.startswith("```"):
-            text = re.sub(r"^```\w*\n?", "", text)
-            text = re.sub(r"\n?```$", "", text)
-            text = text.strip()
-        result = json.loads(text)
-        assert result["risk"] == "medium"
+        assert self._parse(raw)["risk"] == "medium"
+
+    def test_json_with_trailing_commentary(self):
+        # Claude sometimes appends explanatory prose after the JSON object;
+        # raw_decode tolerates it where json.loads would raise "Extra data".
+        raw = (
+            '{"risk": "none", "summary": "Routine.", "findings": []}\n\n'
+            "The diff shows a standard version increment with no concerns."
+        )
+        result = self._parse(raw)
+        assert result["risk"] == "none"
+        assert result["summary"] == "Routine."
+
+    def test_fenced_json_with_trailing_commentary(self):
+        raw = (
+            '```json\n{"risk": "low", "summary": "Minor.", "findings": []}\n```\n'
+            "Additional notes from the model."
+        )
+        assert self._parse(raw)["risk"] == "low"
