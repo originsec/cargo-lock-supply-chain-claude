@@ -36,7 +36,8 @@ runs:
       id: changed
       shell: bash
       run: |
-        if git diff --name-only ${{ steps.base.outputs.ref }}...HEAD | grep -q '^Cargo.lock$'; then
+        # Matches Cargo.lock at any depth (root or nested, e.g. backend/Cargo.lock)
+        if git diff --name-only ${{ steps.base.outputs.ref }}...HEAD | grep -Eq '(^|/)Cargo\.lock$'; then
           echo "lockfile_changed=true" >> "$GITHUB_OUTPUT"
         else
           echo "No Cargo.lock changes detected, skipping audit."

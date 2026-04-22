@@ -2,7 +2,7 @@
 
 A GitHub Action that audits Cargo.lock dependency changes for supply chain attacks using Claude.
 
-When a PR modifies `Cargo.lock`, this action:
+When a PR modifies any `Cargo.lock` (root or nested, e.g. `backend/Cargo.lock`), this action:
 
 1. Diffs the lockfile to find every added, upgraded, or downgraded registry dependency
 2. Downloads the old and new `.crate` tarballs from crates.io
@@ -33,7 +33,7 @@ name: Supply Chain Audit
 on:
   pull_request:
     paths:
-      - "Cargo.lock"
+      - "**/Cargo.lock"
 
 permissions:
   contents: read
