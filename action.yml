@@ -65,8 +65,17 @@ runs:
         AUDIT_CACHE_FILE: ${{ runner.os == 'Windows' && format('{0}\.cache\cargo-lock-supply-chain-audit\verdicts.json', runner.temp) || '~/.cache/cargo-lock-supply-chain-audit/verdicts.json' }}
       run: |
         # Script writes the PR comment to stdout and logs to stderr.
+        #
+        # Disable `-e` around the command substitution. GitHub Actions' default
+        # bash shell runs with `-e`, which aborts on non-zero `$()` — so on a
+        # critical verdict (the case where posting the comment matters most)
+        # bash would abort at the assignment below, never set $GITHUB_OUTPUT,
+        # and the Comment-on-PR step's `steps.audit.outputs.body != ''` guard
+        # would skip posting. That left reviewers with a red ❌ and no reason.
+        set +e
         comment=$(python3 "${{ github.action_path }}/scripts/audit-supply-chain.py" "${{ steps.base.outputs.ref }}")
         exit_code=$?
+        set -e
         if [ -n "$comment" ]; then
           # Use a random heredoc delimiter so attacker-controlled crate source
           # (which reaches stdout via Claude's verdict summary) cannot close the
