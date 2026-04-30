@@ -132,6 +132,26 @@ def parse_semver(v: str) -> tuple[int, int, int]:
     return (int(parts.group(1)), int(parts.group(2)), int(parts.group(3)))
 
 
+def compat_key(v: str) -> tuple:
+    """Cargo's compatibility key for a version.
+
+    Cargo resolves at most one version per compatibility range, so two versions
+    sharing this key occupy the same "slot" in a Cargo.lock. Versions in
+    different slots coexist independently. Used to pair removed/added versions
+    of a multi-version crate along their actual upgrade paths instead of by
+    sorted index.
+    """
+    parts = re.match(r"(\d+)\.(\d+)\.(\d+)", v)
+    if not parts:
+        return ("raw", v)
+    major, minor, patch = int(parts.group(1)), int(parts.group(2)), int(parts.group(3))
+    if major > 0:
+        return (major,)
+    if minor > 0:
+        return (0, minor)
+    return (0, 0, patch)
+
+
 # ---------------------------------------------------------------------------
 # Change detection
 # ---------------------------------------------------------------------------
@@ -224,10 +244,27 @@ def compute_changes(
                     )
                 )
             else:
-                # Multiple version changes — pair by position, extras are adds
-                for old_v in removed_sorted:
-                    if added_sorted:
-                        new_v = added_sorted.pop(0)
+                # Multi-version crate. Pair by Cargo compatibility slot so an
+                # upgrade within e.g. the 0.9.x lineage doesn't get cross-paired
+                # with an unrelated 0.8.x lineage that just happens to share a
+                # sorted-index position. Unpaired added versions are net-new
+                # lineages (audit as added); unpaired removed versions are
+                # dropped lineages (no audit, matching the removed-dep rule).
+                removed_by_lineage: dict[tuple, list[str]] = {}
+                for v in removed_sorted:
+                    removed_by_lineage.setdefault(compat_key(v), []).append(v)
+                added_by_lineage: dict[tuple, list[str]] = {}
+                for v in added_sorted:
+                    added_by_lineage.setdefault(compat_key(v), []).append(v)
+
+                lineages = sorted(
+                    set(removed_by_lineage) | set(added_by_lineage),
+                    key=lambda k: (len(k), k),
+                )
+                for lineage in lineages:
+                    rs = removed_by_lineage.get(lineage, [])
+                    as_ = added_by_lineage.get(lineage, [])
+                    for old_v, new_v in zip(rs, as_):
                         change_type = (
                             "downgraded"
                             if parse_semver(new_v) < parse_semver(old_v)
@@ -243,16 +280,16 @@ def compute_changes(
                                 new_checksum=head_pkgs[name].get(new_v),
                             )
                         )
-                for new_v in added_sorted:
-                    changes.append(
-                        Change(
-                            name=name,
-                            old_version=None,
-                            new_version=new_v,
-                            change_type="added",
-                            new_checksum=head_pkgs[name].get(new_v),
+                    for new_v in as_[len(rs):]:
+                        changes.append(
+                            Change(
+                                name=name,
+                                old_version=None,
+                                new_version=new_v,
+                                change_type="added",
+                                new_checksum=head_pkgs[name].get(new_v),
+                            )
                         )
-                    )
 
     return changes
 
@@ -773,6 +810,33 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
 
+        # Per-(name, version) extraction cache. Two changes can target the
+        # same new_version when a monorepo's lockfiles all bump the same
+        # crate from different starting points; without deduping, the second
+        # iteration's mkdir of the same extract dir crashes with
+        # FileExistsError. Sharing the extracted tree across changes is also
+        # cheaper than re-downloading.
+        fetched: dict[tuple[str, str], tuple[Path | None, str | None]] = {}
+
+        def fetch(name: str, version: str) -> tuple[Path | None, str | None]:
+            key_ = (name, version)
+            if key_ in fetched:
+                return fetched[key_]
+            tarball = download_crate(name, version, tmp)
+            if CRATE_DOWNLOAD_DELAY > 0:
+                time.sleep(CRATE_DOWNLOAD_DELAY)
+            if tarball is None:
+                fetched[key_] = (None, "download_failed")
+                return fetched[key_]
+            extract_dir = tmp / f"crate-{name}-{version}"
+            extract_dir.mkdir(exist_ok=True)
+            extracted = extract_crate(tarball, extract_dir)
+            if extracted is None:
+                fetched[key_] = (None, "extract_failed")
+            else:
+                fetched[key_] = (extracted, None)
+            return fetched[key_]
+
         for i, change in enumerate(changes):
             print(
                 f"[{i+1}/{len(changes)}] Auditing {change.name} "
@@ -796,9 +860,8 @@ def main() -> int:
                 print(f"  cache hit ({key})", file=sys.stderr)
                 continue
 
-            # Download and extract new version
-            new_tarball = download_crate(change.name, change.new_version, tmp)
-            if not new_tarball:
+            new_dir, new_err = fetch(change.name, change.new_version)
+            if new_err == "download_failed":
                 verdicts.append(
                     Verdict(
                         change=change,
@@ -810,11 +873,7 @@ def main() -> int:
                     )
                 )
                 continue
-
-            new_extract_dir = tmp / f"new-{change.name}-{change.new_version}"
-            new_extract_dir.mkdir()
-            new_dir = extract_crate(new_tarball, new_extract_dir)
-            if not new_dir:
+            if new_err == "extract_failed" or new_dir is None:
                 verdicts.append(
                     Verdict(
                         change=change,
@@ -827,19 +886,9 @@ def main() -> int:
                 )
                 continue
 
-            # Download and extract old version (if upgrading/downgrading)
             old_dir = None
             if change.old_version:
-                if CRATE_DOWNLOAD_DELAY > 0:
-                    time.sleep(CRATE_DOWNLOAD_DELAY)
-                old_tarball = download_crate(change.name, change.old_version, tmp)
-                if old_tarball:
-                    old_extract_dir = tmp / f"old-{change.name}-{change.old_version}"
-                    old_extract_dir.mkdir()
-                    old_dir = extract_crate(old_tarball, old_extract_dir)
-
-            if CRATE_DOWNLOAD_DELAY > 0:
-                time.sleep(CRATE_DOWNLOAD_DELAY)
+                old_dir, _ = fetch(change.name, change.old_version)
 
             # Diff
             diff_text = diff_crates(old_dir, new_dir)

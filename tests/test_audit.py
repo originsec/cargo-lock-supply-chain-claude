@@ -19,6 +19,7 @@ audit = importlib.import_module("audit-supply-chain")
 # Re-export for convenience
 parse_lockfile = audit.parse_lockfile
 parse_semver = audit.parse_semver
+compat_key = audit.compat_key
 compute_changes = audit.compute_changes
 Change = audit.Change
 Verdict = audit.Verdict
@@ -285,6 +286,27 @@ class TestParseSemver:
 
 
 # ---------------------------------------------------------------------------
+# compat_key (Cargo compatibility lineage)
+# ---------------------------------------------------------------------------
+
+
+class TestCompatKey:
+    def test_major_at_least_one_groups_by_major(self):
+        assert compat_key("1.0.0") == compat_key("1.5.3")
+        assert compat_key("2.0.0") != compat_key("1.99.99")
+
+    def test_zero_dot_x_groups_by_minor(self):
+        assert compat_key("0.8.5") == compat_key("0.8.999")
+        assert compat_key("0.8.5") != compat_key("0.9.0")
+
+    def test_zero_dot_zero_dot_x_groups_by_patch(self):
+        assert compat_key("0.0.1") != compat_key("0.0.2")
+
+    def test_non_semver_isolated(self):
+        assert compat_key("not-a-version") != compat_key("1.0.0")
+
+
+# ---------------------------------------------------------------------------
 # compute_changes
 # ---------------------------------------------------------------------------
 
@@ -375,6 +397,65 @@ class TestComputeChanges:
         changes = compute_changes(base, head)
         names = [c.name for c in changes]
         assert names == ["alpha", "mid", "zebra"]
+
+    def test_multi_lineage_pairs_within_lineage(self):
+        """Each Cargo compat lineage pairs independently; sorted-index zip
+        would correctly handle this case too, but we want to lock in the
+        within-lineage behavior as the explicit contract."""
+        base = {"rand": {"0.8.5": "a", "0.9.2": "b", "0.10.1": "c"}}
+        head = {"rand": {"0.8.6": "d", "0.9.4": "e", "0.10.1": "c"}}
+        changes = compute_changes(base, head)
+        pairs = {(c.old_version, c.new_version): c.change_type for c in changes}
+        assert pairs == {
+            ("0.8.5", "0.8.6"): "upgraded",
+            ("0.9.2", "0.9.4"): "upgraded",
+        }
+
+    def test_added_lineage_does_not_steal_pair(self):
+        """Regression for the '0.9.2 -> 0.8.6' bug.
+
+        Previously sorted-index zip would pop the new lineage's lowest version
+        (0.8.6) and pair it with the only removed version (0.9.2), reporting a
+        spurious downgrade. The 0.8.x lineage is net-new; the 0.9.x lineage
+        is what actually upgraded.
+        """
+        base = {"rand": {"0.9.2": "b", "0.10.1": "c"}}
+        head = {"rand": {"0.8.6": "d", "0.9.4": "e", "0.10.1": "c"}}
+        changes = compute_changes(base, head)
+        pairs = {(c.old_version, c.new_version): c.change_type for c in changes}
+        assert pairs == {
+            (None, "0.8.6"): "added",
+            ("0.9.2", "0.9.4"): "upgraded",
+        }
+
+    def test_dropped_lineage_not_paired_with_unrelated_add(self):
+        """In the multi-version case, a removed lineage with no replacement
+        must not absorb an unrelated added lineage as its 'upgrade target'.
+        (The single-removed/single-added case still pairs across lineages —
+        see test_single_pair_crosses_majors — because there's no ambiguity.)
+        """
+        base = {"foo": {"0.8.5": "a", "0.10.1": "b"}}
+        head = {"foo": {"0.10.1": "b", "0.11.0": "c", "0.12.0": "d"}}
+        # removed={0.8.5}, added={0.11.0, 0.12.0}: multi-version branch.
+        # Sorted-index zip would pair 0.8.5 -> 0.11.0 (cross-lineage).
+        changes = compute_changes(base, head)
+        pairs = {(c.old_version, c.new_version): c.change_type for c in changes}
+        assert pairs == {
+            (None, "0.11.0"): "added",
+            (None, "0.12.0"): "added",
+        }
+
+    def test_single_pair_crosses_majors(self):
+        """When exactly one version is removed and one added, treat as a
+        direct upgrade even across majors — there's no ambiguity to resolve.
+        Preserves the existing test_major_upgrade contract."""
+        base = {"tokio": {"0.2.25": "a"}}
+        head = {"tokio": {"1.0.0": "b"}}
+        changes = compute_changes(base, head)
+        assert len(changes) == 1
+        assert changes[0].change_type == "upgraded"
+        assert changes[0].old_version == "0.2.25"
+        assert changes[0].new_version == "1.0.0"
 
 
 # ---------------------------------------------------------------------------
